@@ -10,14 +10,22 @@ from homeassistant.components.climate.const import ATTR_MAX_TEMP, ATTR_MIN_TEMP
 from broadlink import DEFAULT_TIMEOUT
 
 from .const import PLATFORMS, DEFAULT_MIN, DEFAULT_MAX
+from .coordinator import ElectroluxCoordinator
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    """Set up one shared Electrolux runtime for the config entry."""
+    coordinator = ElectroluxCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
 
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
 
 # Example migration function
 async def async_migrate_entry(hass, config_entry: ConfigEntry):
