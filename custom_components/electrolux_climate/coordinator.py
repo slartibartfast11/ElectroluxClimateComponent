@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import timedelta
 from functools import partial
 from time import monotonic
 from typing import Any
@@ -26,6 +27,17 @@ _LOGGER = logging.getLogger(__name__)
 
 MAX_CONSECUTIVE_STATUS_FAILURES = 3
 
+POLL_INTERVALS = (
+    SCAN_INTERVAL,
+    timedelta(seconds=5),
+    timedelta(seconds=10),
+    timedelta(seconds=20),
+    timedelta(seconds=30),
+)
+POLL_HEALTH_MAX = 10
+FAST_STATUS_RESPONSE_SECONDS = 1.0
+SLOW_STATUS_RESPONSE_SECONDS = 3.0
+
 
 class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Own one authenticated Electrolux device and one shared status poll."""
@@ -43,6 +55,7 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._validate_reported_sn = False
         self._has_valid_status = False
         self._consecutive_status_failures = 0
+        self._poll_health = 0
 
         self.sn = self.mac.hex()
         self.model: str | None = None
@@ -111,6 +124,8 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"Unable to read Electrolux status: {err}", err
             )
 
+        elapsed = monotonic() - started
+
         try:
             state = json.loads(raw_status)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as err:
@@ -123,15 +138,18 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Electrolux status response was not a JSON object"
             )
 
-        _LOGGER.debug(
-            "%s: status received in %.2fs after %.2fs waiting for device lock",
-            self.entry.title,
-            monotonic() - started,
-            waited,
-        )
-
         self._update_identity(state)
-        self._handle_status_success()
+        self._handle_status_success(elapsed)
+
+        _LOGGER.debug(
+            "%s: status received in %.2fs after %.2fs waiting for device lock; "
+            "health=%d, polling every %ss",
+            self.entry.title,
+            elapsed,
+            waited,
+            self._poll_health,
+            int(self.update_interval.total_seconds()) if self.update_interval else 0,
+        )
         return state
 
     def _handle_status_failure(
@@ -140,6 +158,7 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Retain last-known state for brief status failures after initial setup."""
         self._consecutive_status_failures += 1
         failures = self._consecutive_status_failures
+        self._adjust_poll_health(3, "status failure")
 
         if not self._has_valid_status:
             if err is not None:
@@ -147,17 +166,25 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(message)
 
         if failures >= MAX_CONSECUTIVE_STATUS_FAILURES:
-            _LOGGER.warning(
-                "%s: status read failed %d consecutive times; marking unavailable: %s",
-                self.entry.title,
-                failures,
-                message,
-            )
+            if failures == MAX_CONSECUTIVE_STATUS_FAILURES:
+                _LOGGER.warning(
+                    "%s: status read failed %d consecutive times; marking unavailable: %s",
+                    self.entry.title,
+                    failures,
+                    message,
+                )
+            else:
+                _LOGGER.debug(
+                    "%s: status still unavailable after %d consecutive failures: %s",
+                    self.entry.title,
+                    failures,
+                    message,
+                )
             if err is not None:
                 raise UpdateFailed(message) from err
             raise UpdateFailed(message)
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "%s: status read failed (%d/%d); retaining last known state: %s",
             self.entry.title,
             failures,
@@ -166,10 +193,10 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return self.data
 
-    def _handle_status_success(self) -> None:
-        """Reset transient polling failure state after a valid status response."""
+    def _handle_status_success(self, elapsed: float) -> None:
+        """Reset failure state and update adaptive polling from response latency."""
         if self._consecutive_status_failures:
-            _LOGGER.info(
+            _LOGGER.debug(
                 "%s: status recovered after %d consecutive failure%s",
                 self.entry.title,
                 self._consecutive_status_failures,
@@ -178,6 +205,64 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._consecutive_status_failures = 0
         self._has_valid_status = True
+
+        if elapsed < FAST_STATUS_RESPONSE_SECONDS:
+            self._adjust_poll_health(-2, f"fast status response ({elapsed:.2f}s)")
+        elif elapsed < SLOW_STATUS_RESPONSE_SECONDS:
+            self._adjust_poll_health(1, f"delayed status response ({elapsed:.2f}s)")
+        else:
+            self._adjust_poll_health(2, f"slow status response ({elapsed:.2f}s)")
+
+    def _adjust_poll_health(self, delta: int, reason: str) -> None:
+        """Adjust per-device communication health and the next poll interval."""
+        previous_score = self._poll_health
+        self._poll_health = max(
+            0,
+            min(POLL_HEALTH_MAX, self._poll_health + delta),
+        )
+
+        new_interval = self._poll_interval_for_health(self._poll_health)
+        old_interval = self.update_interval
+
+        if old_interval != new_interval:
+            old_seconds = (
+                int(old_interval.total_seconds())
+                if old_interval is not None
+                else 0
+            )
+            new_seconds = int(new_interval.total_seconds())
+            self.update_interval = new_interval
+            _LOGGER.info(
+                "%s: communication health %d -> %d; polling %ss -> %ss (%s)",
+                self.entry.title,
+                previous_score,
+                self._poll_health,
+                old_seconds,
+                new_seconds,
+                reason,
+            )
+        else:
+            _LOGGER.debug(
+                "%s: communication health %d -> %d; polling remains %ss (%s)",
+                self.entry.title,
+                previous_score,
+                self._poll_health,
+                int(new_interval.total_seconds()),
+                reason,
+            )
+
+    @staticmethod
+    def _poll_interval_for_health(score: int) -> timedelta:
+        """Map communication health score to a bounded polling interval."""
+        if score <= 1:
+            return POLL_INTERVALS[0]
+        if score <= 3:
+            return POLL_INTERVALS[1]
+        if score <= 5:
+            return POLL_INTERVALS[2]
+        if score <= 7:
+            return POLL_INTERVALS[3]
+        return POLL_INTERVALS[4]
 
     def _update_identity(self, state: dict[str, Any]) -> None:
         """Capture stable device metadata from the first successful status."""
