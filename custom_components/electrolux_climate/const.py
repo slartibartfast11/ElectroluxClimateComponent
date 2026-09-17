@@ -14,4 +14,4 @@ MAX_TEMP = 40
 DEFAULT_MAX = 30
 
 PLATFORMS: list[Platform] = [Platform.CLIMATE, Platform.SWITCH]
-SCAN_INTERVAL = timedelta(seconds=5)
+SCAN_INTERVAL = timedelta(seconds=3)
