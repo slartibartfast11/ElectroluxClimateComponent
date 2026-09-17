@@ -29,6 +29,8 @@ from homeassistant.const import UnitOfTemperature, CONF_HOST, CONF_MAC, CONF_NAM
 
 from .const import FAN_QUIET, FAN_TURBO, DEFAULT_MIN, DEFAULT_MAX
 
+_LOGGER = logging.getLogger(__name__)
+
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_HOST): cv.string,
     vol.Optional(ATTR_MIN_TEMP, default=DEFAULT_MIN): cv.positive_int,
@@ -45,24 +47,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entitie
     mac = bytes.fromhex(entry.data[CONF_MAC])
     name = entry.title
     sn = ""
+    model = None
 
     discovery = broadlink.discover(discover_ip_address=host)
     
     if len(discovery) > 0 and discovery[0].devtype == 0x4f9b:
         statusJson = json.loads(create_from_device(discovery[0]).get_status())
-        logging.info(statusJson)
+        model = statusJson.get("modelnumber")
 
         if "sn" in statusJson:
             sn = statusJson["sn"]
         else:
             sn = mac.hex()
-            logging.warning("SN not available on entry")
-            logging.warning(statusJson)
+            _LOGGER.warning(
+                "SN not available for %s; using MAC address as device identifier",
+                name,
+            )
 
     if sn == "":
         return False
 
-    device = ElectroluxClimateEntity(hass, entry, sn, name, entry.data[CONF_NAME], (host, broadlink.DEFAULT_PORT), mac)
+    device = ElectroluxClimateEntity(hass, entry, sn, name, entry.data[CONF_NAME], (host, broadlink.DEFAULT_PORT), mac, model)
     await device.async_setup()
 
     add_entities_async([device], True)
@@ -79,7 +84,8 @@ class ElectroluxClimateEntity(ClimateEntity):
         name: str,
         dev_name: str,
         host: t.Tuple[str, int],
-        mac: t.Union[bytes, str]):
+        mac: t.Union[bytes, str],
+        model: t.Optional[str] = None):
         super().__init__()
         self.hass = hass
         self.config = config
@@ -88,6 +94,8 @@ class ElectroluxClimateEntity(ClimateEntity):
         self.mac = mac
 
         self.sn = sn
+        self.model = model
+        self.manufacturer = "Kelvinator" if model and model.upper().startswith("KSV") else None
         self._attr_unique_id = sn #mac.hex().lower().replace(":", "")
         self._attr_name = name
         self.dev_name = dev_name
@@ -241,8 +249,15 @@ class ElectroluxClimateEntity(ClimateEntity):
     @property
     def device_info(self) -> dr.DeviceInfo:
         """Return device info."""
-        return dr.DeviceInfo(
+        device_info = dr.DeviceInfo(
             connections={(dr.CONNECTION_NETWORK_MAC, self.mac.hex())},
-            identifiers={(DOMAIN, self._attr_unique_id)},
-            name=self.name
+            identifiers={(DOMAIN, self.sn)},
+            name=self.name,
         )
+
+        if self.model:
+            device_info["model"] = self.model
+        if self.manufacturer:
+            device_info["manufacturer"] = self.manufacturer
+
+        return device_info
