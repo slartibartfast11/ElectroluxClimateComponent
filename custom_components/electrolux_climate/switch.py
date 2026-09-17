@@ -1,150 +1,50 @@
-import json
-import typing as t
-import base64
-import json
-import voluptuous as vol
-import homeassistant.helpers.config_validation as cv
-import logging
-
-import broadlink
-
-from .device_command import device_command
-from .electrolux import electrolux, create_from_device, DEVICE_TYPE
-
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr
-
-from .const import DOMAIN
-
-from broadlink.const import DEFAULT_TIMEOUT
-from broadlink.exceptions import AuthenticationError, NetworkTimeoutError, BroadlinkException
-
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.const import CONF_HOST, CONF_MAC, CONF_NAME
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
+from .coordinator import ElectroluxCoordinator
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entities_async) -> bool:
-    """Set up Electrolux Control from a config entry."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    add_entities_async,
+) -> None:
+    """Set up the LED switch from the shared coordinator."""
+    coordinator: ElectroluxCoordinator = entry.runtime_data
+    add_entities_async([ElectroluxClimateLedEntity(coordinator, entry)])
 
-    hass.data.setdefault(DOMAIN, {})
 
-    host = entry.data[CONF_HOST]
-    mac = bytes.fromhex(entry.data[CONF_MAC])
-    name = entry.title
-    sn = ""
-    model = None
+class ElectroluxClimateLedEntity(
+    CoordinatorEntity[ElectroluxCoordinator], SwitchEntity
+):
 
-    discovery = broadlink.discover(discover_ip_address=host)
-    
-    if len(discovery) > 0 and discovery[0].devtype == 0x4f9b:
-        statusJson = json.loads(create_from_device(discovery[0]).get_status())
-        model = statusJson.get("modelnumber")
-
-        if "sn" in statusJson:
-            sn = statusJson["sn"]
-        else:
-            sn = mac.hex()
-            _LOGGER.warning(
-                "SN not available for %s LED; using MAC address as device identifier",
-                name,
-            )
-
-    if sn == "":
-        return False
-
-    ledDev = ElectroluxClimateLedEntity(hass, entry, sn, name, entry.data[CONF_NAME], (host, broadlink.DEFAULT_PORT), mac, model)
-    await ledDev.async_setup()
-
-    add_entities_async([ledDev], True)
-
-    return True
-
-class ElectroluxClimateLedEntity(SwitchEntity):
-
-    def __init__(self, 
-        hass: HomeAssistant,
+    def __init__(
+        self,
+        coordinator: ElectroluxCoordinator,
         config: ConfigEntry,
-        sn: str,
-        name: str,
-        dev_name: str,
-        host: t.Tuple[str, int],
-        mac: t.Union[bytes, str],
-        model: t.Optional[str] = None):
-        super().__init__()
-        self.hass = hass
+    ) -> None:
+        super().__init__(coordinator)
         self.config = config
 
-        self.host = host
-        self.mac = mac
+        self._attr_unique_id = coordinator.sn + "-led"
+        self._attr_name = config.title + " LED"
+        self._apply_coordinator_data()
 
-        self.sn = sn
-        self.model = model
-        self.manufacturer = "Kelvinator" if model and model.upper().startswith("KSV") else None
-        self._attr_unique_id = sn + "-led" #mac.hex().lower().replace(":", "")
-        self._attr_name = name + " LED"
-        self.dev_name = dev_name + " LED"
+    def _apply_coordinator_data(self) -> None:
+        self._attr_is_on = self.coordinator.data["scrdisp"] == 1
 
-    def update(self):
-        state = json.loads(self.device.get_status())
-        if "sn" in state and state["sn"] != self.sn:
-            self._attr_available = False
-            return
-        self._attr_available = True
-        self._attr_is_on = state['scrdisp'] == 1
+    def _handle_coordinator_update(self) -> None:
+        self._apply_coordinator_data()
+        self.async_write_ha_state()
 
-    def turn_on(self):
-        device_command(self.device.set_led, True)
+    async def async_turn_on(self, **kwargs) -> None:
+        await self.coordinator.async_execute(("set_led", (True,)))
 
-    def turn_off(self):
-        device_command(self.device.set_led, False)
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.coordinator.async_execute(("set_led", (False,)))
 
-    async def async_setup(self):
-        """Set up the device and related entities."""
-        
-        self.device = electrolux(
-            self.host, 
-            self.mac, 
-            DEVICE_TYPE,
-            DEFAULT_TIMEOUT, 
-            self.dev_name, 
-            "", 
-            "Electrolux", 
-            False)
-
-        try:
-            await self.hass.async_add_executor_job(
-                self.device.auth
-            )
-
-        except AuthenticationError:
-            return False
-
-        except (NetworkTimeoutError, OSError) as err:
-            raise ConfigEntryNotReady from err
-
-        except BroadlinkException as err:
-            return False
-
-        return True
-    
     @property
-    def device_info(self) -> dr.DeviceInfo:
-        """Return device info."""
-        device_info = dr.DeviceInfo(
-            connections={(dr.CONNECTION_NETWORK_MAC, self.mac.hex())},
-            identifiers={(DOMAIN, self.sn)},
-            name=self.name,
-        )
-
-        if self.model:
-            device_info["model"] = self.model
-        if self.manufacturer:
-            device_info["manufacturer"] = self.manufacturer
-
-        return device_info
+    def device_info(self):
+        return self.coordinator.device_info
