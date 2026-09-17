@@ -26,6 +26,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.const import CONF_HOST, CONF_MAC, CONF_NAME
 
+_LOGGER = logging.getLogger(__name__)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entities_async) -> bool:
     """Set up Electrolux Control from a config entry."""
@@ -36,24 +38,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entitie
     mac = bytes.fromhex(entry.data[CONF_MAC])
     name = entry.title
     sn = ""
+    model = None
 
     discovery = broadlink.discover(discover_ip_address=host)
     
     if len(discovery) > 0 and discovery[0].devtype == 0x4f9b:
         statusJson = json.loads(create_from_device(discovery[0]).get_status())
-        logging.info(statusJson)
+        model = statusJson.get("modelnumber")
 
         if "sn" in statusJson:
             sn = statusJson["sn"]
         else:
-            logging.error("SN not available on entry")
-            logging.error(statusJson)
-            return False
+            sn = mac.hex()
+            _LOGGER.warning(
+                "SN not available for %s LED; using MAC address as device identifier",
+                name,
+            )
 
     if sn == "":
         return False
 
-    ledDev = ElectroluxClimateLedEntity(hass, entry, sn, name, entry.data[CONF_NAME], (host, broadlink.DEFAULT_PORT), mac)
+    ledDev = ElectroluxClimateLedEntity(hass, entry, sn, name, entry.data[CONF_NAME], (host, broadlink.DEFAULT_PORT), mac, model)
     await ledDev.async_setup()
 
     add_entities_async([ledDev], True)
@@ -69,7 +74,8 @@ class ElectroluxClimateLedEntity(SwitchEntity):
         name: str,
         dev_name: str,
         host: t.Tuple[str, int],
-        mac: t.Union[bytes, str]):
+        mac: t.Union[bytes, str],
+        model: t.Optional[str] = None):
         super().__init__()
         self.hass = hass
         self.config = config
@@ -78,13 +84,15 @@ class ElectroluxClimateLedEntity(SwitchEntity):
         self.mac = mac
 
         self.sn = sn
+        self.model = model
+        self.manufacturer = "Kelvinator" if model and model.upper().startswith("KSV") else None
         self._attr_unique_id = sn + "-led" #mac.hex().lower().replace(":", "")
         self._attr_name = name + " LED"
         self.dev_name = dev_name + " LED"
 
     def update(self):
         state = json.loads(self.device.get_status())
-        if state["sn"] != self.sn:
+        if "sn" in state and state["sn"] != self.sn:
             self._attr_available = False
             return
         self._attr_available = True
@@ -128,8 +136,15 @@ class ElectroluxClimateLedEntity(SwitchEntity):
     @property
     def device_info(self) -> dr.DeviceInfo:
         """Return device info."""
-        return dr.DeviceInfo(
+        device_info = dr.DeviceInfo(
             connections={(dr.CONNECTION_NETWORK_MAC, self.mac.hex())},
-            identifiers={(DOMAIN, self._attr_unique_id)},
-            name=self.name
+            identifiers={(DOMAIN, self.sn)},
+            name=self.name,
         )
+
+        if self.model:
+            device_info["model"] = self.model
+        if self.manufacturer:
+            device_info["manufacturer"] = self.manufacturer
+
+        return device_info
