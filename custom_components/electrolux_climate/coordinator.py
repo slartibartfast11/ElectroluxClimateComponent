@@ -101,7 +101,12 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raw_status = await self.hass.async_add_executor_job(
                     self.device.get_status
                 )
-        except (NetworkTimeoutError, OSError, BroadlinkException) as err:
+        except (
+            NetworkTimeoutError,
+            OSError,
+            BroadlinkException,
+            UnicodeDecodeError,
+        ) as err:
             return self._handle_status_failure(
                 f"Unable to read Electrolux status: {err}", err
             )
