@@ -23,7 +23,7 @@ from homeassistant.components.climate.const import FAN_AUTO, FAN_HIGH, FAN_LOW, 
 from homeassistant.components.climate import ClimateEntity, PLATFORM_SCHEMA
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.const import UnitOfTemperature, CONF_HOST, CONF_MAC, CONF_NAME
 
 from .const import FAN_QUIET, FAN_TURBO, DEFAULT_MIN, DEFAULT_MAX
@@ -104,6 +104,18 @@ class ElectroluxClimateEntity(ClimateEntity):
         self._attr_swing_modes = [SWING_OFF, SWING_VERTICAL]
         self._attr_supported_features = ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.SWING_MODE | ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
 
+    def _device_command(self, command, *args):
+        try:
+            return command(*args)
+        except (NetworkTimeoutError, OSError) as err:
+            raise HomeAssistantError(
+                f"Communication with Electrolux air conditioner failed: {err}"
+            ) from err
+        except BroadlinkException as err:
+            raise HomeAssistantError(
+                f"Electrolux air conditioner command failed: {err}"
+            ) from err
+
     def convert_to_hvacmode(self, state: int) -> str:
         match state:
             case electrolux.mode.AUTO.value: 
@@ -151,10 +163,10 @@ class ElectroluxClimateEntity(ClimateEntity):
         self._attr_swing_mode = SWING_OFF if state['ac_vdir'] == 0 else SWING_VERTICAL
 
     def turn_on(self):
-        self.device.set_power(True)
+        self._device_command(self.device.set_power, True)
 
     def turn_off(self):
-        self.device.set_power(False)
+        self._device_command(self.device.set_power, False)
 
     def convert_to_ele_mode(self, mode: HVACMode) -> electrolux.mode:
         match mode:
@@ -175,11 +187,11 @@ class ElectroluxClimateEntity(ClimateEntity):
 
     def set_hvac_mode(self, hvac_mode):
         if hvac_mode == HVACMode.OFF and self.hvac_mode != HVACMode.OFF:
-            self.device.set_power(False)
+            self._device_command(self.device.set_power, False)
         if hvac_mode != HVACMode.OFF:
             if self.hvac_mode == HVACMode.OFF:
-                self.device.set_power(True)
-            self.device.set_mode(self.convert_to_ele_mode(hvac_mode))
+                self._device_command(self.device.set_power, True)
+            self._device_command(self.device.set_mode, self.convert_to_ele_mode(hvac_mode))
 
     def convert_to_ele_fan(self, fan_mode: t.Literal) -> electrolux.fan:
         if fan_mode == FAN_AUTO:
@@ -197,21 +209,21 @@ class ElectroluxClimateEntity(ClimateEntity):
         return electrolux.fan.AUTO
 
     def set_fan_mode(self, fan_mode):
-        self.device.set_fan(self.convert_to_ele_fan(fan_mode))
+        self._device_command(self.device.set_fan, self.convert_to_ele_fan(fan_mode))
 
     def set_swing_mode(self, swing_mode):
-        self.device.set_swing(True if swing_mode == SWING_VERTICAL else False)
+        self._device_command(self.device.set_swing, True if swing_mode == SWING_VERTICAL else False)
 
     def set_temperature(self, **kwargs):
         if isinstance(kwargs["temperature"], float):
-            self.device.set_temp(int(kwargs["temperature"]))
+            self._device_command(self.device.set_temp, int(kwargs["temperature"]))
 
     async def async_setup(self):
         """Set up the device and related entities."""
         
         self.device = electrolux(
             self.host, 
-            self.mac, 
+            self.mac,
             DEVICE_TYPE,
             DEFAULT_TIMEOUT, 
             self.dev_name, 
