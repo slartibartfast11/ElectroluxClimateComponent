@@ -8,6 +8,7 @@ import logging
 
 import broadlink
 
+from .device_command import device_command
 from .electrolux import electrolux, create_from_device, DEVICE_TYPE
 
 from homeassistant.config_entries import ConfigEntry
@@ -90,10 +91,10 @@ class ElectroluxClimateLedEntity(SwitchEntity):
         self._attr_is_on = state['scrdisp'] == 1
 
     def turn_on(self):
-        self.device.set_led(True)
+        device_command(self.device.set_led, True)
 
     def turn_off(self):
-        self.device.set_led(False)
+        device_command(self.device.set_led, False)
 
     async def async_setup(self):
         """Set up the device and related entities."""
