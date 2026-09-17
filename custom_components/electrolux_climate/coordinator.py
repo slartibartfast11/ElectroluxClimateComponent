@@ -24,6 +24,8 @@ from .electrolux import DEVICE_TYPE, electrolux
 
 _LOGGER = logging.getLogger(__name__)
 
+MAX_CONSECUTIVE_STATUS_FAILURES = 3
+
 
 class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Own one authenticated Electrolux device and one shared status poll."""
@@ -39,6 +41,8 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._device_lock = asyncio.Lock()
         self._identity_initialized = False
         self._validate_reported_sn = False
+        self._has_valid_status = False
+        self._consecutive_status_failures = 0
 
         self.sn = self.mac.hex()
         self.model: str | None = None
@@ -98,15 +102,21 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.device.get_status
                 )
         except (NetworkTimeoutError, OSError, BroadlinkException) as err:
-            raise UpdateFailed(f"Unable to read Electrolux status: {err}") from err
+            return self._handle_status_failure(
+                f"Unable to read Electrolux status: {err}", err
+            )
 
         try:
             state = json.loads(raw_status)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as err:
-            raise UpdateFailed(f"Invalid Electrolux status response: {err}") from err
+            return self._handle_status_failure(
+                f"Invalid Electrolux status response: {err}", err
+            )
 
         if not isinstance(state, dict):
-            raise UpdateFailed("Electrolux status response was not a JSON object")
+            return self._handle_status_failure(
+                "Electrolux status response was not a JSON object"
+            )
 
         _LOGGER.debug(
             "%s: status received in %.2fs after %.2fs waiting for device lock",
@@ -116,7 +126,53 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         self._update_identity(state)
+        self._handle_status_success()
         return state
+
+    def _handle_status_failure(
+        self, message: str, err: BaseException | None = None
+    ) -> dict[str, Any]:
+        """Retain last-known state for brief status failures after initial setup."""
+        self._consecutive_status_failures += 1
+        failures = self._consecutive_status_failures
+
+        if not self._has_valid_status:
+            if err is not None:
+                raise UpdateFailed(message) from err
+            raise UpdateFailed(message)
+
+        if failures >= MAX_CONSECUTIVE_STATUS_FAILURES:
+            _LOGGER.warning(
+                "%s: status read failed %d consecutive times; marking unavailable: %s",
+                self.entry.title,
+                failures,
+                message,
+            )
+            if err is not None:
+                raise UpdateFailed(message) from err
+            raise UpdateFailed(message)
+
+        _LOGGER.warning(
+            "%s: status read failed (%d/%d); retaining last known state: %s",
+            self.entry.title,
+            failures,
+            MAX_CONSECUTIVE_STATUS_FAILURES,
+            message,
+        )
+        return self.data
+
+    def _handle_status_success(self) -> None:
+        """Reset transient polling failure state after a valid status response."""
+        if self._consecutive_status_failures:
+            _LOGGER.info(
+                "%s: status recovered after %d consecutive failure%s",
+                self.entry.title,
+                self._consecutive_status_failures,
+                "" if self._consecutive_status_failures == 1 else "s",
+            )
+
+        self._consecutive_status_failures = 0
+        self._has_valid_status = True
 
     def _update_identity(self, state: dict[str, Any]) -> None:
         """Capture stable device metadata from the first successful status."""
