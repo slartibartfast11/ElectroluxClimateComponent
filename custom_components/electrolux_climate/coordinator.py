@@ -50,11 +50,10 @@ class ElectroluxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             config_entry=entry,
             name=f"{DOMAIN}_{entry.entry_id}",
             update_interval=SCAN_INTERVAL,
-            setup_method=self._async_setup_device,
             update_method=self._async_update_data,
         )
 
-    async def _async_setup_device(self) -> None:
+    async def _async_setup(self) -> None:
         """Create and authenticate the shared device once."""
         if self.device is not None:
             return
